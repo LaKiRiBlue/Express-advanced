@@ -1,0 +1,291 @@
+import express from 'express';
+const app = express();
+
+import bcrypt from 'bcrypt';
+import JWT from 'jsonwebtoken';
+import dotenv from 'dotenv';
+dotenv.config();
+import { promisify } from 'util';
+import mysql from 'mysql2/promise';
+import { randomBytes } from 'crypto';
+import lobbyRoutes from './routes/lobby.js';
+import userRoutes from './routes/users.js';
+import { promisifiedSign, promisifiedVerify } from './routes/helpers/jwt.js';
+
+app.use('/api/lobby', lobbyRoutes);
+app.use('/api/users', userRoutes);
+
+
+// Generate a 32-byte (256-bit) random secret key
+const secretKey = randomBytes(32).toString('hex');
+
+console.log('Generated JWT_SECRET:', secretKey);
+
+// Launching express
+const server = express();
+
+// Promisify the JWT helpers
+// => transform callback into Promise-based function (async)
+const sign = promisify(JWT.sign);
+const verify = promisify(JWT.verify);
+
+// Use the json middleware to parse the request body
+server.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server is running on http://localhost:${PORT}`);
+});
+
+//server.listen(3000, () => console.log('http://localhost:3000'));
+
+// Define the structure for message lobbies
+const messageLobbies = [
+  {
+    id: 1,
+    name: 'Lobby 1',
+    admin_id: 1, 
+  
+  },
+  {
+    id: 2,
+    name: 'Lobby 2',
+    admin_id: 2, 
+  },
+  {
+    id: 3,
+    name: 'Lobby 3',
+    admin_id: 3, 
+  },
+  
+];
+// Function to create the message lobbies table if it doesn't exist
+async function createMessageLobbiesTable() {
+  const connection = await pool.getConnection();
+  try {
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS message_lobbies (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        admin_id INT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        -- Add more columns as needed
+        FOREIGN KEY (admin_id) REFERENCES users(id)
+      )
+    `);
+    console.log('Message Lobbies table created');
+  } catch (error) {
+    console.error('Error creating message lobbies table:', error);
+  } finally {
+    connection.release();
+  }
+}
+
+// Call the function to create the message lobbies table
+createMessageLobbiesTable();
+server.post('/api/lobby', async (req, res) => {
+  const { name, admin_id } = req.body;
+
+  if (!name || !admin_id) {
+    return res.status(400).send({ error: 'Invalid request' });
+  }
+
+  try {
+    // Check if the admin user exists
+    const adminUser = await pool.query('SELECT id from users WHERE id=$1', [admin_id]);
+    if (adminUser.rowCount === 0) {
+      return res.status(404).send({ error: 'Admin user not found' });
+    }
+
+    // Create the message lobby
+    const result = await pool.query(
+      'INSERT INTO message_lobbies (name, admin_id) VALUES ($1, $2) RETURNING *',
+      [name, admin_id]
+    );
+
+    const newLobby = result.rows[0];
+    return res.status(201).send({ lobby: newLobby });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send({ error: 'Internal server error' });
+  }
+});
+server.get('/api/lobby', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * from message_lobbies');
+    const lobbies = result.rows;
+    return res.send({ lobbies });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send({ error: 'Internal server error' });
+  }
+});
+server.get('/api/lobby/:id', async (req, res) => {
+  const lobbyId = parseInt(req.params.id);
+
+  if (isNaN(lobbyId)) {
+    return res.status(400).send({ error: 'Invalid lobby ID' });
+  }
+
+  try {
+    const result = await pool.query('SELECT * from message_lobbies WHERE id=$1', [lobbyId]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).send({ error: 'Lobby not found' });
+    }
+
+    const lobby = result.rows[0];
+    return res.send({ lobby });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send({ error: 'Internal server error' });
+  }
+});
+
+
+
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  port: process.env.DB_PORT,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_DATABASE,
+});
+
+// Function to create the users table if it doesn't exist
+async function createUsersTable() {
+  const connection = await pool.getConnection();
+  try {
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        email VARCHAR(255) NOT NULL UNIQUE,
+        password VARCHAR(60) NOT NULL,
+        nickname VARCHAR(100) NOT NULL
+      )
+    `);
+    console.log('Users table created');
+  } catch (error) {
+    console.error('Error creating users table:', error);
+  } finally {
+    connection.release();
+  }
+}
+
+createUsersTable();
+
+
+
+
+server.post('/api/register', async (req, res) => {
+  const { email, nickname, password } = req.body;
+
+  if (!email || !password || !nickname)
+    return res.status(400).send({ error: 'Invalid request' });
+
+  try {
+    // Check if user with the same email already exists
+    const existingUser = await pool.query(
+      'SELECT email from users WHERE email=$1',
+      [email]
+    );
+
+    if (existingUser.rowCount > 0) {
+      return res.status(409).send({ error: 'User already exists with this email' });
+    }
+
+    const encryptedPassword = await bcrypt.hash(password, 10);
+
+    await pool.query(
+      'INSERT INTO users (email, password, nickname) VALUES ($1, $2, $3)',
+      [email, encryptedPassword, nickname]
+    );
+
+    return res.send({ info: 'User successfully created' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send({ error: 'Internal server error' });
+  }
+});
+
+server.post('/api/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password)
+    return res.status(400).send({ error: 'Invalid request' });
+
+  try {
+    const q = await pool.query(
+      'SELECT password, id, nickname from users WHERE email=$1',
+      [email]
+    );
+
+    if (q.rowCount === 0) {
+      return res.status(404).send({ error: 'This user does not exist' });
+    }
+
+    const result = q.rows[0];
+    const match = await bcrypt.compare(password, result.password);
+
+    if (!match) {
+      return res.status(403).send({ error: 'Wrong password' });
+    }
+
+    const token = await sign(
+      { id: result.id, nickname: result.nickname, email },
+      process.env.JWT_SECRET,
+      {
+        algorithm: 'HS512',
+        expiresIn: '1h',
+      }
+    );
+
+    return res.send({ token });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send({ error: 'Cannot generate token' });
+  }
+});
+
+// This middleware will ensure that all subsequent routes include a valid token in the authorization header
+// The 'user' variable will be added to the request object, to be used in the following request listeners
+server.use(async (req, res, next) => {
+  if (!req.headers.authorization) return res.status(401).send('Unauthorized');
+
+  try {
+    const token = req.headers.authorization.split(' ')[1];
+    const decoded = await verify(token, process.env.JWT_SECRET);
+
+    if (decoded !== undefined) {
+      req.user = decoded;
+      return next();
+    }
+  } catch (err) {
+    console.error(err);
+  }
+
+  return res.status(403).send('Invalid token');
+});
+
+server.get('/api/hello', (req, res) => {
+  res.send({ info: 'Hello ' + req.user.nickname });
+});
+
+server.get('/api/users', async (req, res) => {
+  try {
+    const q = await pool.query('SELECT nickname from users');
+    return res.send(q.rows);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send({ error: 'Internal server error' });
+  }
+});
+// Middleware to handle errors
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+
+
+
